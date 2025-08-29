@@ -1819,25 +1819,14 @@ class NodeItem(object):
         else:
             return ":/out_default.png"
     
-    def serialize(self):
-        return {
-            "node": self._node,
-        }
-
-    @staticmethod
-    def deserialize(data_dict):
-        return NodeItem(data_dict["node"])
-    
 class NodeListView(QtWidgets.QListView):
     def __init__(self, parent=None):
         super(NodeListView, self).__init__(parent)
-        # self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.setAcceptDrops(True)      # ドロップを受け付ける
-        self.setDragEnabled(False)     # このリスト自体はドラッグしない
+        self.setAcceptDrops(True)
+        self.setDragEnabled(False) # 複数選択のため無効化
         self.setDropIndicatorShown(True)
         self.setDefaultDropAction(QtCore.Qt.MoveAction)
-        self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-        self.customContextMenuRequested.connect(self.showMenu)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         
         self._drag_start_pos = None
 
@@ -1866,60 +1855,43 @@ class NodeListView(QtWidgets.QListView):
         drag = QtGui.QDrag(self)
         drag.setMimeData(mime_data)
 
-        drag.setPixmap(drag.dragCursor(Qt.MoveAction))  
+        drag.setPixmap(drag.dragCursor(QtCore.Qt.MoveAction))  
         drag.exec_(QtCore.Qt.MoveAction)
         
     def dragEnterEvent(self, event):
+        super(NodeListView, self).dragEnterEvent(event)
         if event.mimeData().hasText():
             event.acceptProposedAction()
-        else:
-            event.ignore()
 
     def dragMoveEvent(self, event):
+        super(NodeListView, self).dragMoveEvent(event)
         if event.mimeData().hasText():
             event.acceptProposedAction()
-        else:
-            event.ignore()
 
     def dropEvent(self, event):
+        super(NodeListView, self).dropEvent(event)
         if event.mimeData().hasText():
             text = event.mimeData().text()
             nodes = text.strip().split()
             model = self.model()
-            items = model.items()
+            items = list(model.items())
             item_nodes = set([i.fullPathName() for i in items])
             
+            add_items = []
             for node in nodes:
                 if cmds.objExists(node) and node not in item_nodes:
-                    items.append(NodeItem(node))
-            model.updateModel(items)
+                    add_items.append(NodeItem(node))
+            row = model.rowCount()
+            model.insertRows(row, len(add_items), add_items)
 
             event.acceptProposedAction()
-        else:
-            event.ignore()
-             
-    def showMenu(self, pos):
-        index = self.indexAt(pos)
-        menu = QtWidgets.QMenu(self)
-        if index.isValid():
-            act_rename = menu.addAction("Rename")
-            act_delete = menu.addAction("Delete")
-            action = menu.exec_(self.mapToGlobal(pos))
-            if action == act_delete:
-                self.model().removeRow(index.row())
-            elif action == act_rename:
-                oldName = self.model().data(index, QtCore.Qt.DisplayRole)
-                newName, ok = QtWidgets.QInputDialog.getText(self, "Rename Node", "New Name:", text=oldName)
-                if ok and newName:
-                    self.model().renameRow(index.row(), newName)
-                  
+
 class NodeListModel(QtCore.QAbstractListModel):
     MimeType = "application/x-nodeitem"
     
     def __init__(self, items=[], parent=None):
         super(NodeListModel, self).__init__(parent)
         self._items = items
-        self._callback_id = om2.MDGMessage.addNodeRemovedCallback(self._node_removed, "dependNode")
     
     def rowCount(self, parent=QtCore.QModelIndex()):
         return len(self._items)
@@ -1931,10 +1903,7 @@ class NodeListModel(QtCore.QAbstractListModel):
         row = index.row()
         if row < 0 or row >= len(self._items):
             return None
-        
-        if not self._items[row].isValid():
-            return
-        
+                
         if role == QtCore.Qt.DisplayRole:
             return self._items[row].name()
         elif role == QtCore.Qt.ToolTipRole:
@@ -1942,120 +1911,266 @@ class NodeListModel(QtCore.QAbstractListModel):
         elif role == QtCore.Qt.DecorationRole:
             return QtGui.QPixmap(self._items[row].icon())
         return None
-    
-    def insertRows(self, row, count, parent=QtCore.QModelIndex()):
-        self.beginInsertRows(parent, row, row + count - 1)
         
-        for _ in range(count):
-            self._items.insert(row, NodeItem())
-        
-        self.endInsertRows()
-        return True
-    
-    def removeRow(self, row, parent=QtCore.QModelIndex()):
-        self.beginRemoveRows(parent, row, row)
-        self.removeRows(row, 1)
-        self.endRemoveRows()
-        
-    def removeRows(self, row, count, parent=QtCore.QModelIndex()):
-        self.beginRemoveRows(parent, row, row + count - 1)
-        
-        for _ in range(count):
-            self._items.pop(row)
-        
-        self.endRemoveRows()
-        return True
-    
-    def supportedDropActions(self):
-        return QtCore.Qt.MoveAction
-    
-    def mimeTypes(self):
-        return [self.MimeType]
-    
-    def mimeData(self, indexes):
-        mime_data = QtCore.QMimeData()
-        rows = sorted(set(i.row() for i in indexes))
-        items = [self._items[r].serialize() for r in rows]
-        mime_data.setData(self.MimeType, json.dumps(items).encode("utf-8"))
-        mime_data.setProperty("rows", rows)  # 元の行を保持
-        return mime_data
-
-    def dropMimeData(self, mime_data, action, row, column, parent):
-        if not mime_data.hasFormat(self.MimeType):
-            return False
-        if action == QtCore.Qt.IgnoreAction:
-            return True
-
-        data_str = bytes(mime_data.data(self.MimeType)).decode("utf-8")
-        items_data = json.loads(data_str)
-        new_items = [NodeItem.deserialize(d) for d in items_data]
-
-        # --- ドロップ位置の決定 ---
-        if row == -1 and parent.isValid():
-            row = parent.row()
-        if row == -1:  # 末尾
-            row = len(self._items)
-
-        # --- 元の行を削除（上から消すとインデックスがずれるので逆順で消す） ---
-        rows = mime_data.property("rows")
-        for r in sorted(rows, reverse=True):
-            self.beginRemoveRows(QtCore.QModelIndex(), r, r)
-            self._items.pop(r)
-            self.endRemoveRows()
-            if r < row:
-                row -= 1  # 挿入位置を修正
-
-        # --- 新しい位置に挿入 ---
-        self.beginInsertRows(QtCore.QModelIndex(), row, row + len(new_items) - 1)
-        for i, item in enumerate(new_items):
-            self._items.insert(row + i, item)
-        self.endInsertRows()
-
-        return True
-    
     def flags(self, index):
         flags = QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
         if index.isValid():
             return flags | QtCore.Qt.ItemIsDragEnabled | QtCore.Qt.ItemIsDropEnabled
         return flags | QtCore.Qt.ItemIsDropEnabled
     
-    def updateModel(self, items):
-        self.beginResetModel()
-        self._items = items
-        self.endResetModel()
-        
-    def renameRow(self, row, newName):
-        """ Mayaノードをリネーム """
-        if 0 <= row < len(self._items):
-            item = self._items[row]
-            try:
-                newName = cmds.rename(item.fullPathName(), newName)
-                self.dataChanged.emit(self.index(row), self.index(row))
-                return newName
-            except Exception as e:
-                om2.MGlobal.displayError("Rename failed: {}".format(e))
-        return None
+    def supportedDropActions(self):
+        return QtCore.Qt.MoveAction
     
-    def _node_removed(self, mObject, clientData):
-        """Mayaノード削除時にリストから自動で削除"""
-        for i, item in enumerate(self._items):
-            if item.mObject() == mObject:
-                self.removeRow(i)
-                break
+    def mimeTypes(self):
+        return ["application/x-myitem"]
 
-    def __del__(self):
-        """コールバックの解除"""
-        if self._callback_id:
-            om2.MMessage.removeCallback(self._callback_id)
-        
+    def mimeData(self, indexes):
+        mime_data = QtCore.QMimeData()
+        rows = [i.row() for i in indexes if i.isValid()]
+        mime_data.setData("application/x-myitem", ",".join(map(str, rows)).encode())
+        return mime_data
+
+    def dropMimeData(self, data, action, row, column, parent):
+        if action == QtCore.Qt.IgnoreAction:
+            return False
+        if not data.hasFormat("application/x-myitem"):
+            return False
+
+        # ドロップ先インデックス
+        if row == -1 and parent.isValid():
+            row = parent.row()
+        if row == -1:
+            row = self.rowCount()
+
+        # ドラッグされた行の取得
+        rows = list(map(int, data.data("application/x-myitem").data().decode().split(",")))
+        rows.sort()
+
+        self.beginResetModel()
+        moving_items = [self._items[r] for r in rows]
+
+        for r in reversed(rows):
+            del self._items[r]
+
+        for i, item in enumerate(moving_items):
+            insert_row = row + i
+            if insert_row > len(self._items):
+                insert_row = len(self._items)
+            self._items.insert(insert_row, item)
+        self.endResetModel()
+        return True
+    
+    def insertRows(self, row, count, items=None, parent=QtCore.QModelIndex()):
+        self.beginInsertRows(parent, row, row + count -1)
+        for i, item in enumerate(items):
+            self._items.insert(row + i, item)
+        self.endInsertRows()
+        return True
+    
     def items(self):
         return self._items
-    
-    
-
         
-    
+# ----------------------------------------------------------------------------------
+# 固定ヘッダーのあるリストビュー
+# ----------------------------------------------------------------------------------    
+class SectionedListModel(QtCore.QAbstractListModel):
+    def __init__(self, data, parent=None):
+        super().__init__(parent)
+        # data = { "A": ["apple", "avocado"], "B": ["banana", "blueberry"] }
+        self.sections = []
+        self.items = []
+        for section, items in data.items():
+            self.sections.append((len(self.items), section))  # (開始インデックス, セクション名)
+            self.items.append({"type": "header", "text": section})
+            for it in items:
+                self.items.append({"type": "item", "text": it})
 
+    def rowCount(self, parent=QtCore.QModelIndex()):
+        return len(self.items)
+
+    def data(self, index, role):
+        if not index.isValid():
+            return None
+        item = self.items[index.row()]
+        if role == QtCore.Qt.DisplayRole:
+            return item["text"]
+        if role == QtCore.Qt.FontRole and item["type"] == "header":
+            font = QtGui.QFont()
+            font.setBold(True)
+            return font
+        if role == QtCore.Qt.BackgroundRole and item["type"] == "header":
+            return QtGui.QBrush(QtGui.QColor(230, 230, 230))
+        return None
+
+class StickyHeaderListView(QtWidgets.QListView):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        model = self.model()
+        if not model:
+            return
+
+        painter = QtGui.QPainter(self.viewport())
+
+        # 現在スクロール位置の最初に見えている index
+        top_index = self.indexAt(QtCore.QPoint(0, 0))
+        if not top_index.isValid():
+            return
+
+        # その index から上方向に header を探す
+        row = top_index.row()
+        while row >= 0:
+            if model.items[row]["type"] == "header":
+                header_index = row
+                break
+            row -= 1
+        else:
+            return
+
+        option = self.viewOptions()
+        rect = self.visualRect(model.index(header_index, 0))
+
+        # 次のヘッダー位置を調べる
+        next_header_y = None
+        for r in range(header_index + 1, model.rowCount()):
+            if model.items[r]["type"] == "header":
+                next_header_y = self.visualRect(model.index(r, 0)).top()
+                break
+
+        # 描画位置（押し上げ処理）
+        header_rect = QtCore.QRect(rect)
+        header_rect.moveTop(0)
+        if next_header_y is not None and next_header_y <= header_rect.height():
+            header_rect.moveTop(next_header_y - header_rect.height())
+
+        # 背景とテキスト描画
+        painter.fillRect(header_rect, QtGui.QColor(230, 230, 230))
+        painter.setFont(QtGui.QFont("", weight=QtGui.QFont.Bold))
+        painter.drawText(header_rect.adjusted(5, 0, 0, 0),
+                         QtCore.Qt.AlignVCenter, model.items[header_index]["text"])
+
+class StickyTreeView(QtWidgets.QTreeView):
+    def __init__(self, parent=None):
+        super(StickyTreeView, self).__init__(parent)
+        self.setHeaderHidden(True)
+        self.setRootIsDecorated(False)
+
+    def paintEvent(self, event):
+        super(StickyTreeView, self).paintEvent(event)
+
+        painter = QtGui.QPainter(self.viewport())
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        # 現在スクロール位置で一番上に見えているインデックス
+        top_index = self.indexAt(QtCore.QPoint(0, 0))
+        if not top_index.isValid():
+            return
+
+        # そのインデックスの親を探す（親がグループ）
+        parent_index = top_index.parent()
+        if parent_index.isValid():
+            group_index = parent_index
+        else:
+            group_index = top_index
+
+        # グループ名
+        group_name = group_index.data()
+
+        # 次のグループの位置を調べる（押し上げ演出用）
+        next_row = group_index.row() + 1
+        next_index = group_index.sibling(next_row, 0)
+        y_offset = 0
+        if next_index.isValid():
+            rect = self.visualRect(next_index)
+            if rect.top() < self.fontMetrics().height():
+                y_offset = rect.top() - self.fontMetrics().height()
+
+        # 固定ヘッダーの矩形
+        header_height = self.fontMetrics().height() + 8
+        rect = QtCore.QRect(0, y_offset, self.viewport().width(), header_height)
+
+        # 背景
+        painter.fillRect(rect, QtGui.QColor(220, 220, 220, 230))
+
+        # テキスト
+        painter.setPen(QtCore.Qt.black)
+        painter.drawText(rect.adjusted(4, 0, -4, 0),
+                         QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
+                         group_name)
+        painter.end()
+
+    
+# ----------------------------------------------------------------------------------
+# タブの非表示
+# ----------------------------------------------------------------------------------    
+class TabManager(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # タブウィジェット
+        self.tab_widget = QtWidgets.QTabWidget()
+        layout.addWidget(self.tab_widget)
+
+        # メニュー
+        self.menu_bar = QtWidgets.QMenuBar()
+        layout.setMenuBar(self.menu_bar)
+        tab_menu = self.menu_bar.addMenu("Tabs")
+
+        # タブページを準備
+        self.pages = {}
+        for name in ["Tab A", "Tab B", "Tab C"]:
+            widget = QtWidgets.QLabel(f"This is {name}")
+            self.pages[name] = widget
+            self.tab_widget.addTab(widget, name)
+
+            # メニューのチェックアクション
+            act = QtWidgets.QAction(name, self, checkable=True, checked=True)
+            act.toggled.connect(lambda checked, n=name: self.toggle_tab(n, checked))
+            tab_menu.addAction(act)
+
+    def toggle_tab(self, name, visible):
+        widget = self.pages[name]
+        index = self.tab_widget.indexOf(widget)
+
+        if visible:
+            # タブが無ければ追加
+            if index == -1:
+                self.tab_widget.addTab(widget, name)
+        else:
+            # タブがあれば削除（widget は保持）
+            if index != -1:
+                self.tab_widget.removeTab(index)
+                
+class TabWidget(QtWidgets.QTabWidget):
+    def __init__(self):
+        super().__init__()
+        self.hidden_tabs = {}  # 非表示タブを保存しておく {name: (widget, index, icon)}
+
+    def hideTab(self, index):
+        if index < 0 or index >= self.count():
+            return
+        widget = self.widget(index)
+        text = self.tabText(index)
+        icon = self.tabIcon(index)
+        # 保持
+        self.hidden_tabs[text] = (widget, index, icon)
+        # タブから削除
+        self.removeTab(index)
+
+    def showTab(self, name):
+        if name not in self.hidden_tabs:
+            return
+        widget, index, icon = self.hidden_tabs.pop(name)
+        # indexが範囲外の場合は最後に追加
+        if index > self.count():
+            index = self.count()
+        self.insertTab(index, widget, icon, name)
     
     
     
