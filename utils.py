@@ -1828,7 +1828,30 @@ class NodeListView(QtWidgets.QListView):
         self.setDefaultDropAction(QtCore.Qt.MoveAction)
         self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         
+        self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.openMenu)
+        
         self._drag_start_pos = None
+
+    def openMenu(self, pos):
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return
+
+        menu = QtWidgets.QMenu(self)
+        delete_action = menu.addAction("削除")
+        action = menu.exec_(self.viewport().mapToGlobal(pos))
+
+        if action == delete_action:
+            self.deleteSelectedItems()
+
+    def deleteSelectedItems(self):
+        model = self.model()
+        selected_indexes = self.selectedIndexes()
+
+        # インデックスを逆順にして削除（順にやるとずれるので）
+        for index in sorted(selected_indexes, key=lambda x: x.row(), reverse=True):
+            model.removeRow(index.row())
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.MiddleButton:
@@ -1860,12 +1883,12 @@ class NodeListView(QtWidgets.QListView):
         
     def dragEnterEvent(self, event):
         super(NodeListView, self).dragEnterEvent(event)
-        if event.mimeData().hasText():
+        if event.mimeData().hasFormat(NodeListModel.MimeType) or event.mimeData().hasText():
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
         super(NodeListView, self).dragMoveEvent(event)
-        if event.mimeData().hasText():
+        if event.mimeData().hasFormat(NodeListModel.MimeType) or event.mimeData().hasText():
             event.acceptProposedAction()
 
     def dropEvent(self, event):
@@ -1887,11 +1910,11 @@ class NodeListView(QtWidgets.QListView):
             event.acceptProposedAction()
 
 class NodeListModel(QtCore.QAbstractListModel):
-    MimeType = "application/x-nodeitem"
+    MimeType = "application/x-myitem"
     
     def __init__(self, items=[], parent=None):
         super(NodeListModel, self).__init__(parent)
-        self._items = items
+        self._items = list(items)
     
     def rowCount(self, parent=QtCore.QModelIndex()):
         return len(self._items)
@@ -1966,6 +1989,16 @@ class NodeListModel(QtCore.QAbstractListModel):
             self._items.insert(row + i, item)
         self.endInsertRows()
         return True
+    
+    def removeRows(self, row, count, parent=QtCore.QModelIndex()):
+        self.beginRemoveRows(parent, row, row + count -1)
+        for _ in range(count):
+            del self._items[row]
+        self.endRemoveRows()
+        return True
+    
+    def removeRow(self, row, parent=QtCore.QModelIndex()):
+        return self.removeRows(row, 1, parent)
     
     def items(self):
         return self._items
@@ -2173,10 +2206,282 @@ class TabWidget(QtWidgets.QTabWidget):
         self.insertTab(index, widget, icon, name)
     
     
-    
-    
-    
-    
-    
-    
-    
+# ----------------------------------------------------------------------------------
+# タブ
+# ----------------------------------------------------------------------------------    
+from PySide2.QtWidgets import*
+from PySide2.QtGui import *
+from PySide2.QtCore import *
+
+class CloseTabCommand(QUndoCommand):
+    def __init__(self, tab_widget, index):
+        super().__init__()
+        self.tab_widget = tab_widget
+        self.index = index
+        self.widget = tab_widget.widget(index)
+        self.text = tab_widget.tabText(index)
+        self.setText(f"Close tab '{self.text}'")
+
+    def undo(self):
+        self.tab_widget.insertTab(self.index, self.widget, self.text)
+        self.tab_widget.setCurrentIndex(self.index)
+
+    def redo(self):
+        self.tab_widget.removeTab(self.index)
+
+class UndoableTabWidget(QTabWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTabsClosable(True)
+        self.tabCloseRequested.connect(self.closeTab)
+        self.undo_stack = QUndoStack(self)
+
+    def addUndoableTab(self, widget, title):
+        self.addTab(widget, title)
+
+    def closeTab(self, index):
+        cmd = CloseTabCommand(self, index)
+        self.undo_stack.push(cmd)
+
+    def undo(self):
+        self.undo_stack.undo()
+        
+
+# ----------------------------------------------------------------------------------
+# TreeView
+# ----------------------------------------------------------------------------------    
+
+from PySide2 import QtCore, QtGui, QtWidgets
+
+# -----------------------------
+# TreeItem
+# -----------------------------
+class TreeItem:
+    def __init__(self, name, attribute="", is_group=False, parent=None):
+        self.name = name
+        self.attribute = attribute
+        self.is_group = is_group
+        self.parent_item = parent
+        self.children = []
+
+    def append_child(self, child):
+        child.parent_item = self
+        self.children.append(child)
+
+    def child(self, row):
+        return self.children[row]
+
+    def child_count(self):
+        return len(self.children)
+
+    def row(self):
+        if self.parent_item:
+            return self.parent_item.children.index(self)
+        return 0
+
+# -----------------------------
+# Custom Tree Model
+# -----------------------------
+class CustomTreeModel(QtCore.QAbstractItemModel):
+    def __init__(self, root, parent=None):
+        super().__init__(parent)
+        self.root_item = root
+
+    def rowCount(self, parent):
+        if parent.isValid():
+            item = parent.internalPointer()
+            return item.child_count()
+        return self.root_item.child_count()
+
+    def columnCount(self, parent):
+        return 2
+
+    def data(self, index, role):
+        if not index.isValid():
+            return None
+        item = index.internalPointer()
+        if role == QtCore.Qt.DisplayRole:
+            if index.column() == 0:
+                return item.name
+            elif index.column() == 1:
+                return item.attribute
+        return None
+
+    def index(self, row, column, parent):
+        if not self.hasIndex(row, column, parent):
+            return QtCore.QModelIndex()
+        if parent.isValid():
+            parent_item = parent.internalPointer()
+        else:
+            parent_item = self.root_item
+        child = parent_item.child(row)
+        if child:
+            return self.createIndex(row, column, child)
+        return QtCore.QModelIndex()
+
+    def parent(self, index):
+        if not index.isValid():
+            return QtCore.QModelIndex()
+        child_item = index.internalPointer()
+        parent_item = child_item.parent_item
+        if parent_item == self.root_item or not parent_item:
+            return QtCore.QModelIndex()
+        return self.createIndex(parent_item.row(), 0, parent_item)
+
+    def flags(self, index):
+        if not index.isValid():
+            return QtCore.Qt.NoItemFlags
+        item = index.internalPointer()
+        if item.is_group:
+            return QtCore.Qt.ItemIsEnabled
+        else:
+            return QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled
+
+# -----------------------------
+# Delegate: グループ行の矩形＆プラス/マイナス
+# -----------------------------
+class GroupDelegate(QtWidgets.QStyledItemDelegate):
+    group_colors = {
+        "TranslateX": QtGui.QColor(0, 0, 255),
+        "TranslateY": QtGui.QColor(0, 0, 255),
+        "TranslateZ": QtGui.QColor(0, 0, 255),
+        "RotateX": QtGui.QColor(255, 0, 0),
+        "RotateY": QtGui.QColor(255, 0, 0),
+        "RotateZ": QtGui.QColor(255, 0, 0),
+        "ScaleX": QtGui.QColor(0, 180, 0),
+        "ScaleY": QtGui.QColor(0, 180, 0),
+        "ScaleZ": QtGui.QColor(0, 180, 0),
+    }
+
+    def paint(self, painter, option, index):
+        item = index.internalPointer()
+        rect = option.widget.visualRect(index)
+        tree = option.widget
+
+        if item.is_group and index.column() == 0:
+            painter.save()
+            # 矩形で塗りつぶす（Name + Attribute列）
+            total_rect = QtCore.QRect(rect)
+            for c in range(1, tree.model().columnCount(QtCore.QModelIndex())):
+                total_rect = total_rect.united(tree.visualRect(tree.model().index(index.row(), c, index.parent())))
+            painter.fillRect(total_rect, QtGui.QColor(220, 220, 220))
+
+            # 左端の太ライン
+            color = self.group_colors.get(item.name, QtGui.QColor(100, 100, 100))
+            pen = QtGui.QPen(color, 4)
+            painter.setPen(pen)
+            painter.drawLine(total_rect.left(), total_rect.top(), total_rect.left(), total_rect.bottom())
+
+            # プラス/マイナス
+            rect_symbol = QtCore.QRect(total_rect.left() + 8, total_rect.center().y() - 6, 12, 12)
+            painter.setPen(QtCore.Qt.black)
+            painter.drawRect(rect_symbol)
+            painter.drawLine(rect_symbol.left() + 2, rect_symbol.center().y(),
+                             rect_symbol.right() - 2, rect_symbol.center().y())
+            if not tree.isExpanded(index):
+                painter.drawLine(rect_symbol.center().x(), rect_symbol.top() + 2,
+                                 rect_symbol.center().x(), rect_symbol.bottom() - 2)
+
+            # テキスト
+            text_rect = QtCore.QRect(rect_symbol.right() + 6, total_rect.top(),
+                                     total_rect.width() - rect_symbol.right() - 6, total_rect.height())
+            painter.drawText(text_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, item.name)
+            painter.restore()
+        elif index.column() == 0:
+            super().paint(painter, option, index)
+        elif index.column() == 1:
+            super().paint(painter, option, index)
+
+    def sizeHint(self, option, index):
+        item = index.internalPointer()
+        size = super().sizeHint(option, index)
+        if item.is_group:
+            size.setHeight(size.height() * 2)
+        return size
+
+# -----------------------------
+# CustomTreeView: グループ行のクリックで展開/折りたたみ
+# -----------------------------
+class CustomTreeView(QtWidgets.QTreeView):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setRootIsDecorated(False)
+
+    def mousePressEvent(self, event):
+        index = self.indexAt(event.pos())
+        if index.isValid():
+            item = index.internalPointer()
+            if item.is_group:
+                # 展開/折りたたみは必ず0列目の index で判定
+                first_col_index = self.model().index(index.row(), 0, index.parent())
+
+                # 全カラムの矩形を union してクリック判定
+                total_rect = self.visualRect(first_col_index)
+                for col in range(1, self.model().columnCount(index.parent())):
+                    col_index = self.model().index(index.row(), col, index.parent())
+                    total_rect = total_rect.united(self.visualRect(col_index))
+
+                if total_rect.contains(event.pos()):
+                    if self.isExpanded(first_col_index):
+                        self.collapse(first_col_index)
+                    else:
+                        self.expand(first_col_index)
+                    return
+        super().mousePressEvent(event)
+
+
+# -----------------------------
+# サンプルウィンドウ
+# -----------------------------
+class TestWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QtWidgets.QVBoxLayout(self)
+        self.tree = CustomTreeView()
+        layout.addWidget(self.tree)
+
+        # ルート
+        root = TreeItem("root", is_group=True)
+
+        # グループ
+        groups = ["TranslateX","TranslateY","TranslateZ",
+                  "RotateX","RotateY","RotateZ",
+                  "ScaleX","ScaleY","ScaleZ"]
+        group_items = {}
+        for g in groups:
+            item = TreeItem(g, is_group=True)
+            root.append_child(item)
+            group_items[g] = item
+
+        # 子アイテム
+        group_items["TranslateX"].append_child(TreeItem("Joint1", attribute=""))
+        group_items["RotateX"].append_child(TreeItem("Joint2", attribute=""))
+        group_items["RotateY"].append_child(TreeItem("Joint3", attribute="TranslateX"))
+        group_items["ScaleZ"].append_child(TreeItem("Joint4", attribute="ScaleZ"))
+
+        model = CustomTreeModel(root, self)
+        self.tree.setModel(model)
+        self.tree.setItemDelegate(GroupDelegate())
+        self.tree.expandAll()
+        self.tree.setColumnWidth(0, 200)
+        self.tree.setColumnWidth(1, 100)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+
